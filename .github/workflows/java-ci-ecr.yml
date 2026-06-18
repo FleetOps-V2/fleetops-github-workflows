@@ -177,12 +177,25 @@ jobs:
 
       - name: SonarQube quality gate
         if: ${{ inputs.run-sonar }}
-        uses: SonarSource/sonarqube-quality-gate-action@v1
-        timeout-minutes: 5
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          scanMetadataReportFile: target/sonar/report-task.txt
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          HOST="${SONAR_HOST_URL:-https://sonarcloud.io}"
+          TASK_ID=$(grep ceTaskId target/sonar/report-task.txt | cut -d= -f2)
+          echo "Polling CE task $TASK_ID ..."
+          for i in $(seq 1 24); do
+            sleep 5
+            STATUS=$(curl -sf "${HOST}/api/ce/task?id=${TASK_ID}" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin).get('task',{}).get('status','PENDING'))" 2>/dev/null || echo "PENDING")
+            echo "  [$i] $STATUS"
+            [ "$STATUS" = "SUCCESS" ]   && break
+            [ "$STATUS" = "FAILED" ]    && { echo "Analysis task failed"; exit 1; }
+            [ "$STATUS" = "CANCELLED" ] && { echo "Analysis cancelled";   exit 1; }
+          done
+          QG=$(curl -sf "${HOST}/api/qualitygates/project_status?projectKey=${{ inputs.sonar-project-key }}" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('projectStatus',{}).get('status','NONE'))")
+          echo "Quality gate: $QG"
+          [ "$QG" = "OK" ] || [ "$QG" = "WARN" ] || { echo "Quality gate FAILED: $QG"; exit 1; }
 
       - name: Fix Maven wrapper permission
         if: ${{ inputs.run-snyk }}
