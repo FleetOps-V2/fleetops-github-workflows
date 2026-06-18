@@ -175,6 +175,10 @@ jobs:
             -Dsonar.token=${SONAR_TOKEN} \
             ${{ inputs.sonar-organization != '' && format('-Dsonar.organization={0}', inputs.sonar-organization) || '' }}
 
+      - name: Debug sonar report
+        if: ${{ inputs.run-sonar }}
+        run: cat target/sonar/report-task.txt || echo "report-task.txt not found"
+
       - name: SonarQube quality gate
         if: ${{ inputs.run-sonar }}
         env:
