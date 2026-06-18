@@ -202,8 +202,12 @@ jobs:
             [ "$STATUS" = "FAILED" ]    && { echo "Analysis task failed"; exit 1; }
             [ "$STATUS" = "CANCELLED" ] && { echo "Analysis cancelled";   exit 1; }
           done
-          echo "Checking quality gate for ${{ inputs.sonar-project-key }} ..."
-          QG=$(curl -sf "${HOST}/api/qualitygates/project_status?projectKey=${{ inputs.sonar-project-key }}" \
+          COMPONENT_KEY=$(python3 -c "import json; print(json.load(open('/tmp/sonar_task.json')).get('task',{}).get('componentKey','unknown'))")
+          ANALYSIS_ID=$(python3 -c "import json; print(json.load(open('/tmp/sonar_task.json')).get('task',{}).get('analysisId',''))")
+          echo "Actual project key: $COMPONENT_KEY"
+          echo "Analysis ID: $ANALYSIS_ID"
+          echo "Checking quality gate ..."
+          QG=$(curl -sf "${HOST}/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}" \
             | python3 -c "import sys,json; print(json.load(sys.stdin).get('projectStatus',{}).get('status','NONE'))")
           echo "Quality gate: $QG"
           [ "$QG" = "OK" ] || [ "$QG" = "WARN" ] || { echo "Quality gate FAILED: $QG"; exit 1; }
