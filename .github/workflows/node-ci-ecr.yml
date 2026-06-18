@@ -1,0 +1,357 @@
+name: Reusable Node CI — ECR
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      node-version:
+        required: false
+        type: string
+        default: "20"
+      sonar-project-key:
+        required: true
+        type: string
+      sonar-organization:
+        required: false
+        type: string
+        default: ""
+      run-sonar:
+        required: false
+        type: boolean
+        default: true
+      run-snyk:
+        required: false
+        type: boolean
+        default: true
+      environment:
+        required: false
+        type: string
+        default: "dev"
+      aws-region:
+        required: false
+        type: string
+        default: "us-east-1"
+      aws-account-id:
+        required: false
+        type: string
+        default: "538661800892"
+    secrets:
+      AWS_ECR_ROLE_ARN:
+        required: true
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+      SNYK_TOKEN:
+        required: false
+      SMTP_HOST:
+        required: false
+      SMTP_PORT:
+        required: false
+      SMTP_USERNAME:
+        required: false
+      SMTP_PASSWORD:
+        required: false
+      EMAIL_TO:
+        required: false
+
+jobs:
+  # ── 1. Resolve image tag ──────────────────────────────────────────────────────
+  prepare:
+    name: prepare-${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      image-tag:      ${{ steps.resolve.outputs.image-tag }}
+      full-image:     ${{ steps.resolve.outputs.full-image }}
+      should-release: ${{ steps.resolve.outputs.should-release }}
+      version:        ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve image tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          ECR="${{ inputs.aws-account-id }}.dkr.ecr.${{ inputs.aws-region }}.amazonaws.com"
+          ECR_REPO="${ECR}/fleetops-${{ inputs.environment }}/${{ inputs.service-name }}"
+          SHOULD_RELEASE=false
+          VERSION=""
+
+          if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            git fetch --tags --force
+            LAST_TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
+            if [[ -z "${LAST_TAG}" ]]; then
+              SHOULD_RELEASE=true; VERSION=v1.0.0
+            else
+              COMMITS="$(git log "${LAST_TAG}"..HEAD --pretty=%B || true)"
+              BUMP=""
+              if   echo "$COMMITS" | grep -Eq  'BREAKING CHANGE|!:';      then BUMP=major
+              elif echo "$COMMITS" | grep -Eiq '^feat(\(.+\))?:';         then BUMP=minor
+              elif echo "$COMMITS" | grep -Eiq '^fix(\(.+\))?:';          then BUMP=patch
+              fi
+              if [[ -n "$BUMP" ]]; then
+                BASE="${LAST_TAG#v}"; IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
+                case "$BUMP" in
+                  major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+                  minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+                  *)     PATCH=$((PATCH+1)) ;;
+                esac
+                SHOULD_RELEASE=true; VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+              fi
+            fi
+            TAG="${VERSION:-main-${GITHUB_SHA::7}}"
+          elif [[ "${GITHUB_REF_NAME}" == "develop" ]]; then
+            TAG="develop-${GITHUB_SHA::7}"
+          else
+            SAFE="${GITHUB_REF_NAME//\//-}"; TAG="${SAFE}-${GITHUB_SHA::7}"
+          fi
+
+          echo "image-tag=${TAG}"                >> "$GITHUB_OUTPUT"
+          echo "full-image=${ECR_REPO}:${TAG}"   >> "$GITHUB_OUTPUT"
+          echo "should-release=${SHOULD_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}"               >> "$GITHUB_OUTPUT"
+          echo "Resolved → tag=${TAG}"
+
+  # ── 2. npm install + build + test + SonarQube + Snyk ─────────────────────────
+  quality:
+    name: quality-${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: SonarQube scan
+        if: ${{ inputs.run-sonar }}
+        uses: SonarSource/sonarqube-scan-action@v3.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ inputs.sonar-project-key }}
+            -Dsonar.projectName=${{ inputs.sonar-project-key }}
+            ${{ inputs.sonar-organization != '' && format('-Dsonar.organization={0}', inputs.sonar-organization) || '' }}
+
+      - name: SonarQube quality gate
+        if: ${{ inputs.run-sonar }}
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          scanMetadataReportFile: .scannerwork/report-task.txt
+
+      - name: Snyk OSS scan (high/critical fail)
+        if: ${{ inputs.run-snyk }}
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: test
+          args: --severity-threshold=high
+
+  # ── 3. Build Docker image → save as artifact ─────────────────────────────────
+  build:
+    name: build-${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    needs: [prepare, quality]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ needs.prepare.outputs.full-image }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          provenance: false
+          sbom: false
+          load: true
+
+      - name: Save image artifact
+        run: docker save "${{ needs.prepare.outputs.full-image }}" -o /tmp/docker-image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ inputs.service-name }}
+          path: /tmp/docker-image.tar
+          retention-days: 1
+
+  # ── 4. Trivy image scan — HIGH/CRITICAL CVEs block push ──────────────────────
+  trivy-scan:
+    name: trivy-${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ inputs.service-name }}
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load -i /tmp/docker-image.tar
+
+      - name: Trivy image scan (HIGH/CRITICAL fail)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ needs.prepare.outputs.full-image }}
+          format: table
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # ── 5. Push to ECR (push events on main/develop only — not PRs) ──────────────
+  push:
+    name: push-${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    needs: [prepare, trivy-scan]
+    if: ${{ github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'develop') }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ inputs.service-name }}
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load -i /tmp/docker-image.tar
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ECR_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image to ECR
+        run: docker push "${{ needs.prepare.outputs.full-image }}"
+
+  # ── 6. SemVer tag + GitHub Release (main only, when bump detected) ───────────
+  release:
+    name: release-${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    needs: [prepare, push]
+    if: ${{ needs.prepare.outputs.should-release == 'true' && github.ref_name == 'main' && needs.push.result == 'success' }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create SemVer tag and GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "Tag $VERSION already exists — skipping"
+          else
+            git tag "$VERSION"
+            git push origin "$VERSION"
+          fi
+          gh release view "$VERSION" >/dev/null 2>&1 || \
+            gh release create "$VERSION" \
+              --title "$VERSION" \
+              --notes "Automated release for ${{ inputs.service-name }} $VERSION"
+
+  # ── 7. Email notification (push events only; SMTP optional) ──────────────────
+  notify:
+    name: notify-${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    needs: [prepare, quality, build, trivy-scan, push, release]
+    if: always() && github.event_name == 'push'
+    steps:
+      - name: Send Email (Success)
+        if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+        uses: dawidd6/action-send-mail@v3
+        continue-on-error: true
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port:    ${{ secrets.SMTP_PORT }}
+          username:       ${{ secrets.SMTP_USERNAME }}
+          password:       ${{ secrets.SMTP_PASSWORD }}
+          subject: "CI Success — ${{ inputs.service-name }} ${{ needs.prepare.outputs.image-tag }}"
+          body: |
+            Build and Push Successful
+
+            Service:      ${{ inputs.service-name }}
+            Tag:          ${{ needs.prepare.outputs.image-tag }}
+            Repository:   ${{ github.repository }}
+            Branch:       ${{ github.ref_name }}
+            Triggered By: ${{ github.actor }}
+          to:   ${{ secrets.EMAIL_TO }}
+          from: GitHub Actions
+
+      - name: Send Email (Failure)
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        uses: dawidd6/action-send-mail@v3
+        continue-on-error: true
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port:    ${{ secrets.SMTP_PORT }}
+          username:       ${{ secrets.SMTP_USERNAME }}
+          password:       ${{ secrets.SMTP_PASSWORD }}
+          subject: "CI Failed — ${{ inputs.service-name }} — Run #${{ github.run_number }}"
+          body: |
+            CI Pipeline Failed
+
+            Service:       ${{ inputs.service-name }}
+            Repository:    ${{ github.repository }}
+            Branch:        ${{ github.ref_name }}
+            Triggered By:  ${{ github.actor }}
+            Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to:   ${{ secrets.EMAIL_TO }}
+          from: GitHub Actions

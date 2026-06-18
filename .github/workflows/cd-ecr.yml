@@ -1,0 +1,239 @@
+name: Reusable FleetOps CD — ECR
+
+# Triggered by workflow_run (CI success) via per-service cd.yml callers.
+# Resolves the image tag that CI built, then updates the manifest repo.
+# update-dev and update-prod are separate jobs so production can have
+# an 'environment: production' gate (required reviewers, deployment rules).
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      ci-workflow-name:
+        description: "Must match the 'name:' of the triggering CI workflow"
+        required: true
+        type: string
+      deploy-env:
+        description: "dev or prod"
+        required: true
+        type: string
+      head-sha:
+        description: "Full SHA from github.event.workflow_run.head_sha"
+        required: true
+        type: string
+      aws-account-id:
+        required: false
+        type: string
+        default: "538661800892"
+      aws-region:
+        required: false
+        type: string
+        default: "us-east-1"
+    secrets:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+      SMTP_HOST:
+        required: false
+      SMTP_PORT:
+        required: false
+      SMTP_USERNAME:
+        required: false
+      SMTP_PASSWORD:
+        required: false
+      EMAIL_TO:
+        required: false
+
+jobs:
+  # ── Dev deployment — updates values-dev.yaml with develop-<sha> tag ──────────
+  update-dev:
+    name: update-dev-${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    if: ${{ inputs.deploy-env == 'dev' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve dev image tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="${{ inputs.head-sha }}"
+          TAG="develop-${SHA:0:7}"
+          VALUES_FILE="charts/${{ inputs.service-name }}/values-dev.yaml"
+          echo "image-tag=${TAG}"         >> "$GITHUB_OUTPUT"
+          echo "values-file=${VALUES_FILE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved dev tag: ${TAG}"
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: fleetops-deployments
+
+      - name: Checkout deployments repo
+        uses: actions/checkout@v4
+        with:
+          repository: FleetOps-V2/fleetops-deployments
+          path: manifest-repo
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Update image tag in values-dev.yaml
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.image-tag }}"
+          VALUES_FILE="manifest-repo/${{ steps.tag.outputs.values-file }}"
+
+          if [[ ! -f "${VALUES_FILE}" ]]; then
+            echo "Error: Values file not found: ${VALUES_FILE}"
+            exit 1
+          fi
+
+          yq e ".image.tag = \"${TAG}\"" -i "${VALUES_FILE}"
+          echo "Updated image.tag → ${TAG}"
+          cat "${VALUES_FILE}"
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE="${{ inputs.service-name }}"
+          TAG="${{ steps.tag.outputs.image-tag }}"
+          VALUES_FILE="${{ steps.tag.outputs.values-file }}"
+
+          cd manifest-repo
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${VALUES_FILE}"
+          git diff --cached --quiet && echo "No tag change — skipping commit" && exit 0
+          git commit -m "chore(${SERVICE}): bump dev image tag to ${TAG} [skip ci]"
+          git push
+
+  # ── Prod deployment — looks up the semver tag CI just pushed, updates values-prod.yaml ──
+  update-prod:
+    name: update-prod-${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    if: ${{ inputs.deploy-env == 'prod' }}
+    environment: production   # triggers GitHub environment protection rules
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout service repo (to read semver tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve prod image tag (latest semver pushed by CI)
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1 || echo 'v1.0.0')"
+          if [[ -z "${TAG}" ]]; then TAG=v1.0.0; fi
+          VALUES_FILE="charts/${{ inputs.service-name }}/values-prod.yaml"
+          echo "image-tag=${TAG}"          >> "$GITHUB_OUTPUT"
+          echo "values-file=${VALUES_FILE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved prod tag: ${TAG}"
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: fleetops-deployments
+
+      - name: Checkout deployments repo
+        uses: actions/checkout@v4
+        with:
+          repository: FleetOps-V2/fleetops-deployments
+          path: manifest-repo
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Update image tag in values-prod.yaml
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.image-tag }}"
+          VALUES_FILE="manifest-repo/${{ steps.tag.outputs.values-file }}"
+
+          if [[ ! -f "${VALUES_FILE}" ]]; then
+            echo "Error: Values file not found: ${VALUES_FILE}"
+            exit 1
+          fi
+
+          yq e ".image.tag = \"${TAG}\"" -i "${VALUES_FILE}"
+          echo "Updated image.tag → ${TAG}"
+          cat "${VALUES_FILE}"
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE="${{ inputs.service-name }}"
+          TAG="${{ steps.tag.outputs.image-tag }}"
+          VALUES_FILE="${{ steps.tag.outputs.values-file }}"
+
+          cd manifest-repo
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${VALUES_FILE}"
+          git diff --cached --quiet && echo "No tag change — skipping commit" && exit 0
+          git commit -m "release($SERVICE): deploy ${TAG} [skip ci]"
+          git push
+
+  # ── Email notification (SMTP optional) ───────────────────────────────────────
+  notify:
+    name: notify-${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    needs: [update-dev, update-prod]
+    if: always()
+    steps:
+      - name: Send Email (Success)
+        if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+        uses: dawidd6/action-send-mail@v3
+        continue-on-error: true
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port:    ${{ secrets.SMTP_PORT }}
+          username:       ${{ secrets.SMTP_USERNAME }}
+          password:       ${{ secrets.SMTP_PASSWORD }}
+          subject: "CD Success (${{ inputs.deploy-env }}) — ${{ inputs.service-name }}"
+          body: |
+            Deployment to ${{ inputs.deploy-env }} Successful
+
+            Service:      ${{ inputs.service-name }}
+            Repository:   ${{ github.repository }}
+            Triggered By: ${{ github.actor }}
+          to:   ${{ secrets.EMAIL_TO }}
+          from: GitHub Actions
+
+      - name: Send Email (Failure)
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        uses: dawidd6/action-send-mail@v3
+        continue-on-error: true
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port:    ${{ secrets.SMTP_PORT }}
+          username:       ${{ secrets.SMTP_USERNAME }}
+          password:       ${{ secrets.SMTP_PASSWORD }}
+          subject: "CD Failed (${{ inputs.deploy-env }}) — ${{ inputs.service-name }} — Run #${{ github.run_number }}"
+          body: |
+            CD Pipeline Failed
+
+            Service:       ${{ inputs.service-name }}
+            Environment:   ${{ inputs.deploy-env }}
+            Repository:    ${{ github.repository }}
+            Triggered By:  ${{ github.actor }}
+            Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to:   ${{ secrets.EMAIL_TO }}
+          from: GitHub Actions
