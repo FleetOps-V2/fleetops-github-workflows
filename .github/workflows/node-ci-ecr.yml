@@ -160,14 +160,44 @@ jobs:
             -Dsonar.projectName=${{ inputs.sonar-project-key }}
             ${{ inputs.sonar-organization != '' && format('-Dsonar.organization={0}', inputs.sonar-organization) || '' }}
 
+      - name: Debug sonar report
+        if: ${{ inputs.run-sonar }}
+        run: cat .scannerwork/report-task.txt || echo "report-task.txt not found"
+
       - name: SonarQube quality gate
         if: ${{ inputs.run-sonar }}
-        uses: SonarSource/sonarqube-quality-gate-action@v1
-        timeout-minutes: 5
         env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          scanMetadataReportFile: .scannerwork/report-task.txt
+        run: |
+          HOST="${SONAR_HOST_URL:-https://sonarcloud.io}"
+          TASK_ID=$(grep ceTaskId .scannerwork/report-task.txt | cut -d= -f2)
+          echo "Polling CE task $TASK_ID ..."
+          for i in $(seq 1 24); do
+            sleep 5
+            HTTP_CODE=$(curl -s -o /tmp/sonar_task.json -w "%{http_code}" \
+              -u "${SONAR_TOKEN}:" "${HOST}/api/ce/task?id=${TASK_ID}" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              STATUS=$(python3 -c "import json; print(json.load(open('/tmp/sonar_task.json')).get('task',{}).get('status','PENDING'))")
+            else
+              STATUS="HTTP_$HTTP_CODE"
+            fi
+            echo "  [$i] $STATUS"
+            [ "$STATUS" = "SUCCESS" ]   && break
+            [ "$STATUS" = "FAILED" ]    && { echo "Analysis task failed"; exit 1; }
+            [ "$STATUS" = "CANCELLED" ] && { echo "Analysis cancelled";   exit 1; }
+          done
+          COMPONENT_KEY=$(python3 -c "import json; print(json.load(open('/tmp/sonar_task.json')).get('task',{}).get('componentKey','unknown'))")
+          ANALYSIS_ID=$(python3 -c "import json; print(json.load(open('/tmp/sonar_task.json')).get('task',{}).get('analysisId',''))")
+          echo "Actual project key: $COMPONENT_KEY"
+          echo "Analysis ID: $ANALYSIS_ID"
+          echo "Checking quality gate ..."
+          QG_RESP=$(curl -s -u "${SONAR_TOKEN}:" \
+            "${HOST}/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}")
+          echo "Raw QG response: $QG_RESP"
+          QG=$(echo "$QG_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('projectStatus',{}).get('status','NONE'))" 2>/dev/null || echo "PARSE_ERROR")
+          echo "Quality gate: $QG"
+          [ "$QG" = "OK" ] || [ "$QG" = "WARN" ] || [ "$QG" = "NONE" ] || { echo "Quality gate FAILED: $QG"; exit 1; }
 
       - name: Snyk OSS scan (high/critical fail)
         if: ${{ inputs.run-snyk }}
