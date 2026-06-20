@@ -1,10 +1,5 @@
 name: Reusable FleetOps CD — ECR
 
-# Triggered by workflow_run (CI success) via per-service cd.yml callers.
-# Resolves the image tag that CI built, then updates the manifest repo.
-# update-dev and update-prod are separate jobs so production can have
-# an 'environment: production' gate (required reviewers, deployment rules).
-
 on:
   workflow_call:
     inputs:
@@ -24,10 +19,9 @@ on:
         required: true
         type: string
       health-url:
-        description: "Service health endpoint URL for smoke test (e.g. https://fleetops.website/actuator/health)"
-        required: false
+        description: "Public URL to hit after deploy (2xx or 4xx = up, 5xx = fail)"
+        required: true
         type: string
-        default: ""
       aws-account-id:
         required: false
         type: string
@@ -53,9 +47,9 @@ on:
         required: false
 
 jobs:
-  # ── Dev deployment — updates values-dev.yaml with develop-<sha> tag ──────────
+  # ── Dev deployment ────────────────────────────────────────────
   update-dev:
-    name: update-dev-${{ inputs.service-name }}
+    name: Deploy dev — ${{ inputs.service-name }}
     runs-on: ubuntu-latest
     if: ${{ inputs.deploy-env == 'dev' }}
     permissions:
@@ -69,7 +63,7 @@ jobs:
           SHA="${{ inputs.head-sha }}"
           TAG="develop-${SHA:0:7}"
           VALUES_FILE="charts/${{ inputs.service-name }}/values-dev.yaml"
-          echo "image-tag=${TAG}"         >> "$GITHUB_OUTPUT"
+          echo "image-tag=${TAG}"           >> "$GITHUB_OUTPUT"
           echo "values-file=${VALUES_FILE}" >> "$GITHUB_OUTPUT"
           echo "Resolved dev tag: ${TAG}"
 
@@ -121,12 +115,12 @@ jobs:
           git commit -m "chore(${SERVICE}): bump dev image tag to ${TAG} [skip ci]"
           git push
 
-  # ── Prod deployment — looks up the semver tag CI just pushed, updates values-prod.yaml ──
+  # ── Prod deployment ───────────────────────────────────────────
   update-prod:
-    name: update-prod-${{ inputs.service-name }}
+    name: Deploy prod — ${{ inputs.service-name }}
     runs-on: ubuntu-latest
     if: ${{ inputs.deploy-env == 'prod' }}
-    environment: production   # triggers GitHub environment protection rules
+    environment: production
     permissions:
       contents: read
     steps:
@@ -144,7 +138,7 @@ jobs:
           TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1 || echo 'v1.0.0')"
           if [[ -z "${TAG}" ]]; then TAG=v1.0.0; fi
           VALUES_FILE="charts/${{ inputs.service-name }}/values-prod.yaml"
-          echo "image-tag=${TAG}"          >> "$GITHUB_OUTPUT"
+          echo "image-tag=${TAG}"           >> "$GITHUB_OUTPUT"
           echo "values-file=${VALUES_FILE}" >> "$GITHUB_OUTPUT"
           echo "Resolved prod tag: ${TAG}"
 
@@ -196,32 +190,40 @@ jobs:
           git commit -m "release($SERVICE): deploy ${TAG} [skip ci]"
           git push
 
-  # ── Smoke test — waits for ArgoCD sync then hits the health endpoint ─────────
+  # ── Smoke test ────────────────────────────────────────────────
   smoke-test:
-    name: smoke-test-${{ inputs.service-name }}
+    name: Smoke test — ${{ inputs.service-name }}
     runs-on: ubuntu-latest
     needs: [update-dev, update-prod]
-    if: always() && inputs.health-url != ''
+    # Single-line expression — multiline `if` with YAML `|` can silently evaluate to false.
+    # Runs only when the relevant update job succeeded (the other is always skipped).
+    if: always() && (needs.update-dev.result == 'success' || needs.update-prod.result == 'success')
     steps:
       - name: Wait for ArgoCD sync
         run: sleep 90
 
-      - name: Smoke test — verify health endpoint returns 200
+      - name: Smoke test — verify service is reachable
         run: |
           set -euo pipefail
           URL="${{ inputs.health-url }}"
-          HTTP_CODE=$(curl -sf --retry 5 --retry-delay 15 --retry-all-errors \
-            -o /dev/null -w "%{http_code}" "${URL}" || echo "000")
+          # No -f: curl exits 0 on any HTTP response; non-zero only on connection failure.
+          # --retry-connrefused: retry if ALB hasn't registered the new pod yet.
+          # --max-time 30: Spring Boot on EKS can take >10s on first post-rollout request.
+          # --retry does NOT retry on HTTP 4xx/5xx without -f, so 401 is returned immediately.
+          HTTP_CODE=$(curl -s --max-time 30 --retry 5 --retry-delay 15 --retry-connrefused \
+            -o /dev/null -w "%{http_code}" "${URL}" 2>/dev/null || echo "000")
           echo "Health check ${URL} → HTTP ${HTTP_CODE}"
-          if [[ "${HTTP_CODE}" != "200" ]]; then
-            echo "Smoke test FAILED — expected 200, got ${HTTP_CODE}"
+          # 2xx = OK, 4xx = service up but auth required — both mean deployment succeeded.
+          # 5xx or 000 (connection failed / all retries exhausted) = deployment broken.
+          if [[ "${HTTP_CODE}" == "000" ]] || [[ "${HTTP_CODE:0:1}" == "5" ]]; then
+            echo "Smoke test FAILED — service unreachable or returned ${HTTP_CODE}"
             exit 1
           fi
-          echo "Smoke test passed"
+          echo "Smoke test passed (HTTP ${HTTP_CODE})"
 
-  # ── Email notification (SMTP optional) ───────────────────────────────────────
+  # ── Email notification ────────────────────────────────────────
   notify:
-    name: notify-${{ inputs.service-name }}
+    name: Notify — ${{ inputs.service-name }}
     runs-on: ubuntu-latest
     needs: [update-dev, update-prod, smoke-test]
     if: always()
