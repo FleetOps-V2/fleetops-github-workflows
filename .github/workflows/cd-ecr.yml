@@ -113,6 +113,7 @@ jobs:
           git add "${VALUES_FILE}"
           git diff --cached --quiet && echo "No tag change — skipping commit" && exit 0
           git commit -m "chore(${SERVICE}): bump dev image tag to ${TAG} [skip ci]"
+          git pull --rebase origin main
           git push
 
   # ── Prod deployment ───────────────────────────────────────────
@@ -188,6 +189,7 @@ jobs:
           git add "${VALUES_FILE}"
           git diff --cached --quiet && echo "No tag change — skipping commit" && exit 0
           git commit -m "release($SERVICE): deploy ${TAG} [skip ci]"
+          git pull --rebase origin main
           git push
 
   # ── Smoke test ────────────────────────────────────────────────
