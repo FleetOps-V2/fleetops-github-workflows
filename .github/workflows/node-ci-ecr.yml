@@ -202,7 +202,6 @@ jobs:
       - name: Snyk OSS scan (high/critical fail)
         if: ${{ inputs.run-snyk }}
         uses: snyk/actions/node@master
-        continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
